@@ -1,191 +1,113 @@
-import random
 import pandas as pd
+import random
 
 
-class ScheduleOptimizer:
-    def __init__(self, loader, evaluator):
+class GeneticOptimizer:
+    def __init__(self, loader, evaluator, generator, population_size=20, generations=30):
         self.loader = loader
         self.evaluator = evaluator
-        self._score_cache = {}
-        self.required_task_counts = self._build_required_task_counts()
+        self.generator = generator
+        self.size = population_size
+        self.generations = generations
 
-    def _build_required_task_counts(self):
-        counts = {}
-        group_ids = [int(g) for g in self.loader.groups["group_id"].tolist()]
-        for _, sub in self.loader.subjects.iterrows():
-            subject_id = int(sub["subject_id"])
-            lecture_n = int(sub.get("lecture", 0) or 0)
-            seminar_n = int(sub.get("seminar", 0) or 0)
-            lab_n = int(sub.get("lab", 0) or 0)
+    def optimize(self, schedule):
+        print(f"Популяций: {self.size}, Поколений: {self.generations}")
 
-            for group_id in group_ids:
-                counts[(group_id, subject_id, "lecture")] = lecture_n
-                counts[(group_id, subject_id, "seminar")] = seminar_n
-                counts[(group_id, subject_id, "lab")] = lab_n
-        return counts
+        population = []
+        #расписание от жадного алгоритма
+        if schedule is not None and not schedule.empty:
+            population.append(schedule.copy())
 
-    def optimize(self, initial_df, iterations=250):
-        best_df = self._normalize_df(initial_df)
-        if best_df.empty:
-            print("[!] Оптимизатор: пустое расписание")
-            return best_df, self.evaluator.evaluate(best_df)
-
-        # ВАЖНО:
-        # теперь оптимизатор допускает неполное расписание.
-        # Он отбрасывает только явные конфликты / лишние пары сверх плана.
-        if not self._is_valid_schedule(best_df):
-            print("[!] Начальное расписание содержит конфликты или лишние пары, оптимизация пропущена")
-            return best_df, self.evaluator.evaluate(best_df)
-
-        best_metrics = self.evaluator.evaluate(best_df)
-        print(
-            f"Начало оптимизации: "
-            f"score={best_metrics['score']}, "
-            f"missing={best_metrics.get('missing_lessons', 0)}, "
-            f"conflicts={self._hard_conflicts(best_metrics)}"
-        )
-
-        for i in range(iterations):
-            blocks = self._get_blocks(best_df)
-            if not blocks:
-                break
-
-            block = random.choice(blocks)
-            old_slot = int(block["data"]["slot_id"].iloc[0])
-
-            sample_size = min(12, len(self.loader.all_slots))
-            if len(self.loader.all_slots) > sample_size:
-                candidate_slots = random.sample(self.loader.all_slots, sample_size)
+        print("cоздание начальной популяции")
+        while len(population) < self.size:
+            res = self.generator.generate()
+            if isinstance(res, tuple):
+                df = res[0]
             else:
-                candidate_slots = list(self.loader.all_slots)
+               df = res
+            if df is not None and not df.empty:
+                population.append(df)
 
-            improved = False
+        best_df = None
+        best_score = -float('inf')
 
-            for new_slot in candidate_slots:
-                if int(new_slot) == old_slot:
-                    continue
+        for x in range(self.generations):
+            # оценка популяции
+            evaluated = []
+            for ind in population:
+                indicators = self.evaluator.evaluate(ind)
+                evaluated.append((indicators['score'], ind))
 
-                candidate_df = best_df.copy()
-                candidate_df.loc[block["indexes"], "slot_id"] = int(new_slot)
-                candidate_df = self._normalize_df(candidate_df)
+            # сортировка оценки
+            evaluated.sort(key=lambda x: x[0], reverse=True)
 
-                if not self._is_valid_schedule(candidate_df):
-                    continue
+            current_best_score, current_best_df = evaluated[0]
 
-                candidate_metrics = self.evaluator.evaluate(candidate_df)
+            # сохранение лучшего расписания
+            if current_best_score > best_score:
+                best_score = current_best_score
+                best_df = current_best_df.copy()
+                print(f"поколение {x + 1}: оценка = {best_score}")
 
-                if self._is_better(candidate_metrics, best_metrics):
-                    best_df = candidate_df
-                    best_metrics = candidate_metrics
-                    improved = True
-                    if i % 25 == 0:
-                        print(
-                            f"Итерация {i}: улучшение -> "
-                            f"score={best_metrics['score']}, "
-                            f"missing={best_metrics.get('missing_lessons', 0)}, "
-                            f"conflicts={self._hard_conflicts(best_metrics)}"
-                        )
-                    break
+            # выбор половины лучших расписаний
+            elite_size = max(2, self.size // 2)
+            elite = [ind for score, ind in evaluated[:elite_size]]
 
-            if improved:
-                continue
+            new_population = [ind.copy() for ind in elite]
 
-        return best_df, best_metrics
+            # скрещивание и мутации
+            while len(new_population) < self.size:
+                p1 = random.choice(elite)
+                p2 = random.choice(elite)
 
-    def _normalize_df(self, df):
-        if df is None or df.empty:
-            return pd.DataFrame(columns=[
-                "slot_id", "group_id", "subject_id",
-                "teacher_id", "room_id", "lesson_type"
-            ])
+                # Скрещивание двух расписаний по предметам
+                new = self._crossover_by_subject(p1, p2)
 
-        normalized = df.copy().reset_index(drop=True)
+                if random.random() < 0.4:
+                    new = self._mutate_blocks(new)
 
-        required_cols = ["slot_id", "group_id", "subject_id", "teacher_id", "room_id", "lesson_type"]
-        for col in required_cols:
-            if col not in normalized.columns:
-                normalized[col] = None
+                new_population.append(new)
 
-        for col in ["slot_id", "group_id", "subject_id", "teacher_id", "room_id"]:
-            normalized[col] = pd.to_numeric(normalized[col], errors="coerce").fillna(0).astype(int)
+            population = new_population
 
-        normalized["lesson_type"] = normalized["lesson_type"].astype(str).str.strip().str.lower()
+        print(f"итоговая оценка {best_score}")
+        return best_df
 
-        normalized = normalized.drop_duplicates(
-            subset=["slot_id", "group_id", "subject_id", "teacher_id", "room_id", "lesson_type"]
-        ).reset_index(drop=True)
+    def _crossover_by_subject(self, p1, p2):
+        #скрещивание
+        if p1.empty or p2.empty:
+            return p1.copy()
 
-        return normalized[required_cols]
+        subjects = p1['subject_id'].unique().tolist()
+        random.shuffle(subjects)
+        split_point = len(subjects) // 2
 
-    def _get_blocks(self, df):
-        grouped = df.groupby(
-            ["slot_id", "subject_id", "teacher_id", "room_id", "lesson_type"],
-            sort=False
-        )
-        return [{"indexes": block.index.tolist(), "data": block} for _, block in grouped]
+        s1_subjects = subjects[:split_point]
 
-    def _hard_conflicts(self, metrics):
-        return (
-            int(metrics.get("group_conflicts", 0))
-            + int(metrics.get("teacher_conflicts", 0))
-            + int(metrics.get("room_conflicts", 0))
-            + int(metrics.get("duplicate_rows", 0))
-            + int(metrics.get("task_overflow", 0))
-        )
+        part1 = p1[p1['subject_id'].isin(s1_subjects)]
+        part2 = p2[~p2['subject_id'].isin(s1_subjects)]
 
-    def _is_better(self, candidate_metrics, best_metrics):
-        # Главный порядок:
-        # 1) меньше hard conflicts
-        # 2) меньше missing lessons
-        # 3) выше score
-        candidate_key = (
-            self._hard_conflicts(candidate_metrics),
-            int(candidate_metrics.get("missing_lessons", 0)),
-            -int(candidate_metrics.get("score", -10**9)),
-        )
-        best_key = (
-            self._hard_conflicts(best_metrics),
-            int(best_metrics.get("missing_lessons", 0)),
-            -int(best_metrics.get("score", -10**9)),
-        )
-        return candidate_key < best_key
+        res = pd.concat([part1, part2], ignore_index=True)
+        return res
 
-    def _task_counts_not_overflow(self, df):
-        current = df.groupby(["group_id", "subject_id", "lesson_type"]).size().to_dict()
+    def _mutate_blocks(self, df):
+        #мутация
+        mutated_df = df.copy()
+        if mutated_df.empty:
+            return mutated_df
 
-        for key, current_count in current.items():
-            required = int(self.required_task_counts.get(key, 0))
-            if int(current_count) > required:
-                return False
-        return True
+        # группировка по блокам
+        grouped = mutated_df.groupby(["slot_id", "subject_id", "teacher_id", "room_id", "lesson_type"], sort=False)
+        blocks = [block.index.tolist() for _, block in grouped]
 
-    def _is_valid_schedule(self, df):
-        if df is None or df.empty:
-            return False
+        if not blocks:
+            return mutated_df
 
-        # Разрешаем неполный план, но не разрешаем overflow
-        if not self._task_counts_not_overflow(df):
-            return False
+        num_mutations = max(1, int(len(blocks) * 0.05))
 
-        # У группы не может быть 2 занятий в один слот
-        if df.duplicated(subset=["slot_id", "group_id"]).any():
-            return False
+        for _ in range(num_mutations):
+            block_indexes = random.choice(blocks)
+            new_slot = random.choice(self.loader.all_slots)
+            mutated_df.loc[block_indexes, 'slot_id'] = new_slot
 
-        # У преподавателя в одном слоте допустима только одна сущность занятия
-        teacher_nunique = df.groupby(["slot_id", "teacher_id"])[["subject_id", "lesson_type", "room_id"]].nunique()
-        if (teacher_nunique > 1).any(axis=1).any():
-            return False
-
-        # У аудитории в одном слоте допустима только одна сущность занятия
-        room_nunique = df.groupby(["slot_id", "room_id"])[["subject_id", "lesson_type", "teacher_id"]].nunique()
-        if (room_nunique > 1).any(axis=1).any():
-            return False
-
-        # Полные дубли одной и той же записи запрещены
-        lesson_dup = df.duplicated(
-            subset=["slot_id", "subject_id", "teacher_id", "room_id", "lesson_type", "group_id"]
-        )
-        if lesson_dup.any():
-            return False
-
-        return True
+        return mutated_df
