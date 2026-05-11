@@ -23,7 +23,6 @@ class GreedyGenerator:
                 test.append(task)
         if test:
             print(f"не размещено {len(test)} пар")
-            print(*test, sep='\n')
         return pd.DataFrame(schedule)
 
     def _build_task_queue(self):
@@ -108,12 +107,24 @@ class GreedyGenerator:
         return False
 
     def _slot_priority(self, slot_id, group_busy_slots):
-        if not group_busy_slots:
-            return 2
-
         target = self.loader.slot_details[slot_id]
+        target_day = target['day']
+
+        day_count = sum(1 for b_id in group_busy_slots if self.loader.slot_details[b_id]['day'] == target_day)
+
+        penalty = day_count * 0.5
+
+        if day_count >= 4:
+            penalty += (day_count - 3) * 2
+
+        if not group_busy_slots:
+            return 2 + penalty
+
         for b_id in group_busy_slots:
             b = self.loader.slot_details[b_id]
-            if target['day'] == b['day'] and abs(target['slot_number'] - b['slot_number']) == 1:
-                return 0
-        return 1
+            if b['day'] == target_day and abs(target['slot_number'] - b['slot_number']) == 1:
+                return 0 + penalty
+
+        return 1 + penalty
+
+
